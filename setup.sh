@@ -22,7 +22,7 @@ echo "===================================================="
 echo ""
 
 # 1. Check Python version
-PYTHON=$(which python3 || which python)
+PYTHON=$(which python3.12 || which python3.11 || which python3 || which python)
 PY_VERSION=$($PYTHON --version 2>&1)
 echo "[1/5] Python found: $PY_VERSION"
 
