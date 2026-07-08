@@ -1,0 +1,17 @@
+# Credentials — NEVER commit this file
+config.ini
+
+# Python virtual environment
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Log files
+*.log
+logs/
+
+# Runtime data
+data/
+*.png
+*.html
