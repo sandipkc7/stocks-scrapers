@@ -135,15 +135,21 @@ async def fetch_and_save_daily_share():
     retries = 3
     for attempt in range(1, retries + 1):
         try:
-            # Force authentication
-            print(f"Retrieving authorization token (attempt {attempt}/{retries})...")
-            await nepse.getMarketStatus()
+            # Force authentication and retrieve market status
+            print(f"Retrieving authorization token & market status (attempt {attempt}/{retries})...")
+            status = await nepse.getMarketStatus()
             
-            today_date = date.today().isoformat()
-            print(f"Fetching daily price summary for: {today_date}...")
+            # Extract last update date from market status
+            asOf = status.get('asOf')
+            if asOf:
+                target_date = asOf.split('T')[0]
+            else:
+                target_date = date.today().isoformat()
+                
+            print(f"Fetching daily price summary for: {target_date}...")
             
-            # Get daily price history for today
-            resp_json = await nepse.getPriceVolumeHistory(today_date)
+            # Get daily price history for the target date
+            resp_json = await nepse.getPriceVolumeHistory(target_date)
             data = resp_json.get("content", [])
             if data:
                 print(f"Retrieved {len(data)} scrip price records from NEPSE API.")
