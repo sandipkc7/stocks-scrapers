@@ -53,11 +53,85 @@ def safe_float(val):
     except ValueError:
         return 0.0
 
+def fetch_from_sharesansar_fallback():
+    print("Attempting fallback: Scraping daily prices from ShareSansar...")
+    import requests
+    from bs4 import BeautifulSoup
+    
+    URL = "https://www.sharesansar.com/today-share-price"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+    }
+    
+    try:
+        response = requests.get(URL, headers=headers, timeout=20)
+        response.raise_for_status()
+        html = response.text
+        
+        bs = BeautifulSoup(html, "html.parser")
+        try:
+            today_text = bs.find("span", {"class": "text-org"}).text.strip()
+        except AttributeError:
+            today_text = date.today().isoformat()
+            
+        table = bs.find("table")
+        if not table:
+            print("No tables found on ShareSansar page.")
+            return []
+            
+        headers_list = [th.text.strip() for th in table.find_all("th")]
+        
+        try:
+            idx_symbol = headers_list.index("Symbol")
+            idx_open = headers_list.index("Open")
+            idx_high = headers_list.index("High")
+            idx_low = headers_list.index("Low")
+            idx_close = headers_list.index("Close")
+            idx_prev_close = headers_list.index("Prev. Close")
+            idx_vol = headers_list.index("Vol")
+            idx_turnover = headers_list.index("Turnover")
+        except ValueError as e:
+            print(f"Could not find required columns in ShareSansar headers: {headers_list}")
+            return []
+            
+        records = []
+        tbody = table.find("tbody")
+        rows = tbody.find_all("tr") if tbody else table.find_all("tr")[1:]
+        
+        for row in rows:
+            cols = row.find_all("td")
+            if len(cols) < len(headers_list):
+                continue
+                
+            symbol = cols[idx_symbol].text.strip()
+            if not symbol:
+                continue
+                
+            records.append((
+                today_text,
+                symbol,
+                safe_float(cols[idx_open].text),
+                safe_float(cols[idx_high].text),
+                safe_float(cols[idx_low].text),
+                safe_float(cols[idx_close].text),
+                safe_float(cols[idx_prev_close].text),
+                safe_float(cols[idx_vol].text),
+                safe_float(cols[idx_turnover].text),
+            ))
+            
+        print(f"Fallback retrieved {len(records)} scrip price records from ShareSansar for date {today_text}.")
+        return records
+    except Exception as fallback_err:
+        print(f"Fallback scraping from ShareSansar failed: {fallback_err}")
+        traceback.print_exc()
+        return []
+
 async def fetch_and_save_daily_share():
     print("Initializing Nepse API client...")
     nepse = AsyncNepse()
     nepse.setTLSVerification(False)
     
+    data = None
     try:
         # Force authentication
         print("Retrieving authorization token...")
@@ -69,15 +143,14 @@ async def fetch_and_save_daily_share():
         # Get daily price history for today
         resp_json = await nepse.getPriceVolumeHistory(today_date)
         data = resp_json.get("content", [])
-        print(f"Retrieved {len(data)} scrip price records.")
+        print(f"Retrieved {len(data)} scrip price records from NEPSE API.")
+    except Exception as e:
+        print(f"NEPSE API connection error: {e}. Fallback to ShareSansar will be attempted.")
         
-        if not data:
-            print("No daily price records returned by NEPSE API.")
-            return False
-            
-        records = []
-        unique_dates = set()
-        
+    records = []
+    unique_dates = set()
+    
+    if data:
         for item in data:
             date_val = item.get('businessDate')
             symbol_val = item.get('symbol')
@@ -108,7 +181,18 @@ async def fetch_and_save_daily_share():
                 turnover
             ))
             unique_dates.add(date_val)
+    else:
+        # Trigger fallback
+        fallback_records = fetch_from_sharesansar_fallback()
+        if fallback_records:
+            records = fallback_records
+            for rec in records:
+                unique_dates.add(rec[0])
+        else:
+            print("No daily price records returned by NEPSE API or fallback scraper.")
+            return False
             
+    try:
         print(f"Connecting to database to save {len(records)} records...")
         conn, cur = setup_db()
         
@@ -141,7 +225,7 @@ async def fetch_and_save_daily_share():
         return True
         
     except Exception as e:
-        print(f"An error occurred: {e}")
+        print(f"An error occurred during database operations: {e}")
         traceback.print_exc()
         return False
     finally:
