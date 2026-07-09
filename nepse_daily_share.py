@@ -132,20 +132,30 @@ async def fetch_and_save_daily_share():
     nepse.setTLSVerification(False)
     
     data = None
-    try:
-        # Force authentication
-        print("Retrieving authorization token...")
-        await nepse.getMarketStatus()
-        
-        today_date = date.today().isoformat()
-        print(f"Fetching daily price summary for: {today_date}...")
-        
-        # Get daily price history for today
-        resp_json = await nepse.getPriceVolumeHistory(today_date)
-        data = resp_json.get("content", [])
-        print(f"Retrieved {len(data)} scrip price records from NEPSE API.")
-    except Exception as e:
-        print(f"NEPSE API connection error: {e}. Fallback to ShareSansar will be attempted.")
+    retries = 3
+    for attempt in range(1, retries + 1):
+        try:
+            # Force authentication
+            print(f"Retrieving authorization token (attempt {attempt}/{retries})...")
+            await nepse.getMarketStatus()
+            
+            today_date = date.today().isoformat()
+            print(f"Fetching daily price summary for: {today_date}...")
+            
+            # Get daily price history for today
+            resp_json = await nepse.getPriceVolumeHistory(today_date)
+            data = resp_json.get("content", [])
+            if data:
+                print(f"Retrieved {len(data)} scrip price records from NEPSE API.")
+                break
+            else:
+                print(f"Attempt {attempt} returned empty daily price records from NEPSE API.")
+        except Exception as e:
+            print(f"Attempt {attempt} failed with NEPSE API error: {e}")
+            if attempt < retries:
+                await asyncio.sleep(2)
+            else:
+                print("All NEPSE API attempts failed. Fallback to ShareSansar will be attempted.")
         
     records = []
     unique_dates = set()
