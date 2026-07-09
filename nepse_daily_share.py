@@ -131,22 +131,45 @@ async def fetch_and_save_daily_share():
     nepse = AsyncNepse()
     nepse.setTLSVerification(False)
     
+    # 1. Resolve last update date from NEPSE
+    status = None
+    target_date = date.today().isoformat()
+    try:
+        # Force authentication and retrieve market status
+        print("Retrieving authorization token & market status to check date...")
+        status = await nepse.getMarketStatus()
+        asOf = status.get('asOf')
+        if asOf:
+            target_date = asOf.split('T')[0]
+    except Exception as e:
+        print(f"Failed to retrieve initial market status: {e}")
+        
+    # 2. Check if daily price has already been successfully scraped for this date
+    try:
+        conn, cur = setup_db()
+        cur.execute("SELECT daily_price FROM calendar WHERE date = %s", (target_date,))
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+        if row and row[0] is True:
+            print(f"Daily price data for {target_date} has already been scraped (daily_price = True in calendar). Skipping execution.")
+            await nepse.client.aclose()
+            return True
+    except Exception as db_err:
+        print(f"Database calendar check failed: {db_err}. Proceeding with fetch.")
+        
+    # 3. Retrieve daily prices
     data = None
     retries = 3
     for attempt in range(1, retries + 1):
         try:
-            # Force authentication and retrieve market status
-            print(f"Retrieving authorization token & market status (attempt {attempt}/{retries})...")
-            status = await nepse.getMarketStatus()
-            
-            # Extract last update date from market status
-            asOf = status.get('asOf')
-            if asOf:
-                target_date = asOf.split('T')[0]
-            else:
-                target_date = date.today().isoformat()
-                
-            print(f"Fetching daily price summary for: {target_date}...")
+            if not status and attempt > 1:
+                status = await nepse.getMarketStatus()
+                asOf = status.get('asOf')
+                if asOf:
+                    target_date = asOf.split('T')[0]
+                    
+            print(f"Fetching daily price summary for: {target_date} (attempt {attempt}/{retries})...")
             
             # Get daily price history for the target date
             resp_json = await nepse.getPriceVolumeHistory(target_date)
