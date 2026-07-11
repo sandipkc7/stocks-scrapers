@@ -126,7 +126,7 @@ def fetch_from_sharesansar_fallback():
         traceback.print_exc()
         return []
 
-async def fetch_and_save_daily_share():
+async def fetch_and_save_daily_share(force=False):
     print("Initializing Nepse API client...")
     nepse = AsyncNepse()
     nepse.setTLSVerification(False)
@@ -145,18 +145,21 @@ async def fetch_and_save_daily_share():
         print(f"Failed to retrieve initial market status: {e}")
         
     # 2. Check if daily price has already been successfully scraped for this date
-    try:
-        conn, cur = setup_db()
-        cur.execute("SELECT daily_price FROM calendar WHERE date = %s", (target_date,))
-        row = cur.fetchone()
-        cur.close()
-        conn.close()
-        if row and row[0] is True:
-            print(f"Daily price data for {target_date} has already been scraped (daily_price = True in calendar). Skipping execution.")
-            await nepse.client.aclose()
-            return True
-    except Exception as db_err:
-        print(f"Database calendar check failed: {db_err}. Proceeding with fetch.")
+    if not force:
+        try:
+            conn, cur = setup_db()
+            cur.execute("SELECT daily_price FROM calendar WHERE date = %s", (target_date,))
+            row = cur.fetchone()
+            cur.close()
+            conn.close()
+            if row and row[0] is True:
+                print(f"Daily price data for {target_date} has already been scraped (daily_price = True in calendar). Skipping execution.")
+                await nepse.client.aclose()
+                return True
+        except Exception as db_err:
+            print(f"Database calendar check failed: {db_err}. Proceeding with fetch.")
+    else:
+        print(f"Bypassing already-scraped check (force = True).")
         
     # 3. Retrieve daily prices
     data = None
@@ -271,4 +274,6 @@ async def fetch_and_save_daily_share():
         await nepse.client.aclose()
 
 if __name__ == "__main__":
-    asyncio.run(fetch_and_save_daily_share())
+    import sys
+    force_pull = "--force" in sys.argv or "--force-pull" in sys.argv
+    asyncio.run(fetch_and_save_daily_share(force=force_pull))

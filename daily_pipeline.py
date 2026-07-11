@@ -40,6 +40,7 @@ PIPELINE_SCRIPTS = [
     'nepse_live_index.py',
     'process_summary.py',
     'compute_indicators.py',
+    'check_alerts_email.py',      # Step 9: Evaluate alerts & queue notification emails
 ]
 
 # ---------------------------------------------------------------------------
@@ -160,15 +161,20 @@ def get_holiday_data_freshness(conn):
 # Script Execution
 # ---------------------------------------------------------------------------
 
-def run_script(python_bin, script_name):
+def run_script(python_bin, script_name, args=None):
     script_path = os.path.join(SCRIPT_DIR, script_name)
     log("")
     log("=" * 60)
     log(f"RUNNING: {script_name}")
     log("=" * 60)
+
+    cmd = [python_bin, script_path]
+    if args:
+        cmd.extend(args)
+
     try:
         proc = subprocess.Popen(
-            [python_bin, script_path],
+            cmd,
             cwd=SCRIPT_DIR,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -250,7 +256,10 @@ def main():
     # STEPS 4-9: Run scrapers
     results = {}
     for script_name in PIPELINE_SCRIPTS:
-        success = run_script(python_bin, script_name)
+        args = []
+        if script_name == 'nepse_daily_share.py':
+            args = ['--force']
+        success = run_script(python_bin, script_name, args=args)
         results[script_name] = success
         try:
             conn = get_db_conn()
