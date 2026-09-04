@@ -1,46 +1,49 @@
 """
-NEPSE Daily Pipeline — Standalone Python Server
-=================================================
-Designed to run on a server that has ONLY Python installed.
-Connects directly to a remote PostgreSQL database via config.ini.
-
-Pipeline order:
-  1. nepse_holiday.py      - refresh holiday calendar
-  2. Holiday/Saturday check - abort if non-trading day
-  3. nepse_companies.py    - update company list
+Daily Pipeline Orchestrator for NEPSE Data Scraping
+====================================================
+Runs all daily scrapers in order:
+  1. nepse_holiday.py     - refresh holiday calendar
+  2. (holiday check)      - if today is a holiday/Saturday, stop
+  3. nepse_companies.py   - update company list
   4. chukulscraper_safe.py - fetch floorsheet data
   5. nepse_daily_share.py  - fetch daily share prices
   6. nepse_live_index.py   - fetch live/current index
-  7. process_summary.py    - aggregate broker summaries
+  7. process_summary.py   - aggregate broker summaries
   8. compute_indicators.py - calculate technical indicators
 
-Scheduling (Linux cron):
-  45 9 * * *  user  cd /path/to/pythonserver && ./.venv/bin/python daily_pipeline.py >> pipeline.log 2>&1
-
-Deployment (GitHub):
-  git pull && echo "Updated."
+Scheduling:
+  - Linux (Production): runs every day at 3:30 PM NPT via cron
+  - Windows (Local): runs via Task Scheduler at 3:30 PM
+  - Can also be triggered from Admin Panel (scraper_control.php)
 """
 import sys
 import os
 import subprocess
 import psycopg2
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 import traceback
 
-# Force UTF-8 output to avoid encoding errors on non-UTF-8 terminals
+# Force UTF-8 output on Windows to avoid cp1252 UnicodeEncodeError
 if hasattr(sys.stdout, 'reconfigure'):
     sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 
+# Resolve paths relative to this script's directory
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+LOG_FILE = os.path.join(SCRIPT_DIR, 'current_scrape.log')
 
+# Pipeline scripts to run after holiday check (in order)
 PIPELINE_SCRIPTS = [
     'nepse_companies.py',
     'chukulscraper_safe.py',
     'nepse_daily_share.py',
+    'calculate_adjusted_preopen.py',
     'nepse_live_index.py',
     'process_summary.py',
+    'scrape_nepsealpha.py',
+    'scrape_nepsealpha_bydate.py',
     'compute_indicators.py',
-    'check_alerts_email.py',      # Step 9: Evaluate alerts & queue notification emails
+    'scrape_nepsealpha_fundamentals.py',
+    'compute_trend_tb_ts.py',
 ]
 
 # ---------------------------------------------------------------------------
@@ -48,26 +51,37 @@ PIPELINE_SCRIPTS = [
 # ---------------------------------------------------------------------------
 
 def get_python_bin():
+    """Resolve the correct Python binary (.venv or system fallback)."""
     is_windows = sys.platform.startswith('win')
-    venv = os.path.join(SCRIPT_DIR, '.venv',
-                        'Scripts' if is_windows else 'bin',
-                        'python.exe' if is_windows else 'python')
-    return venv if os.path.exists(venv) else ('python' if is_windows else 'python3')
+    venv_python = os.path.join(
+        SCRIPT_DIR, '.venv',
+        'Scripts' if is_windows else 'bin',
+        'python.exe' if is_windows else 'python'
+    )
+    if os.path.exists(venv_python):
+        return venv_python
+    return 'python' if is_windows else 'python3'
 
 def get_db_conn():
+    """Open a PostgreSQL connection using db_config.py."""
     sys.path.insert(0, SCRIPT_DIR)
     from db_config import DB_CONFIG
     return psycopg2.connect(**DB_CONFIG)
 
 def log(msg):
+    """Print with timestamp, flushed immediately (captured by shell redirection)."""
     timestamp = datetime.now().strftime('%H:%M:%S')
     print(f"[{timestamp}] {msg}", flush=True)
 
 # ---------------------------------------------------------------------------
-# DB Tracking
+# Database tracking helpers
 # ---------------------------------------------------------------------------
 
 def ensure_pipeline_columns(conn):
+    """
+    Add pipeline tracking columns to the calendar table if they don't exist.
+    This is safe to run every time (IF NOT EXISTS).
+    """
     cur = conn.cursor()
     cur.execute("""
         ALTER TABLE calendar
@@ -80,9 +94,17 @@ def ensure_pipeline_columns(conn):
     cur.close()
 
 def record_pipeline_status(conn, run_date, status, failed_steps=None):
+    """
+    Upsert today's pipeline run status into the calendar table.
+    status: 'holiday' | 'success' | 'partial' | 'failed'
+    """
     try:
         cur = conn.cursor()
-        cur.execute("INSERT INTO calendar (date) VALUES (%s) ON CONFLICT (date) DO NOTHING;", (run_date,))
+        # Ensure the date row exists in calendar first
+        cur.execute("""
+            INSERT INTO calendar (date) VALUES (%s)
+            ON CONFLICT (date) DO NOTHING;
+        """, (run_date,))
         failed_str = ', '.join(failed_steps) if failed_steps else None
         cur.execute("""
             UPDATE calendar
@@ -98,13 +120,18 @@ def record_pipeline_status(conn, run_date, status, failed_steps=None):
         log(f"[WARN] Could not update calendar pipeline status: {e}")
 
 def send_notification(conn, title, message='', notif_type='info', source='daily_pipeline.py'):
+    """Insert a row into system_notifications following the existing protocol."""
     try:
         cur = conn.cursor()
         cur.execute("""
             CREATE TABLE IF NOT EXISTS system_notifications (
-                id SERIAL PRIMARY KEY, type VARCHAR(30) NOT NULL DEFAULT 'info',
-                title VARCHAR(255) NOT NULL, message TEXT, source VARCHAR(100),
-                is_read BOOLEAN DEFAULT FALSE, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                id SERIAL PRIMARY KEY,
+                type VARCHAR(30) NOT NULL DEFAULT 'info',
+                title VARCHAR(255) NOT NULL,
+                message TEXT,
+                source VARCHAR(100),
+                is_read BOOLEAN DEFAULT FALSE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
         cur.execute("""
@@ -122,29 +149,43 @@ def send_notification(conn, title, message='', notif_type='info', source='daily_
 # ---------------------------------------------------------------------------
 
 def is_today_non_trading(conn):
+    """
+    Returns (True, reason) if today is a non-trading day, else (False, '').
+
+    Logic (in order):
+    1. Saturday in Nepal (weekday 5 in Python) is always non-trading.
+    2. Check if today is marked holiday=TRUE in the calendar table.
+    3. Fallback: if no calendar row exists for today at all, allow trading
+       (the holiday scraper just finished; absence of a holiday row means trading day).
+    """
     today = date.today()
 
-    # Saturday is always non-trading in Nepal
+    # 1. Saturday is always non-trading in Nepal
     if today.weekday() == 5:
         return True, "Saturday is a non-trading day in Nepal."
 
+    # 2. DB holiday check
     try:
         cur = conn.cursor()
         cur.execute(
-            'SELECT holiday, "Holiday_Description" FROM calendar WHERE date = %s',
+            "SELECT holiday, \"Holiday_Description\" FROM calendar WHERE date = %s",
             (today,)
         )
         row = cur.fetchone()
         cur.close()
         if row and row[0] is True:
             desc = row[1] or 'Public Holiday'
-            return True, f"Marked as holiday: {desc}"
+            return True, f"Today is marked as a holiday in the calendar: {desc}"
     except Exception as e:
-        log(f"[WARN] Could not query calendar for holiday: {e}. Assuming trading day.")
+        log(f"[WARN] Could not query calendar for holiday status: {e}. Assuming trading day.")
 
     return False, ''
 
-def get_holiday_data_freshness(conn):
+def get_holiday_api_last_update(conn):
+    """
+    Returns the most recent date for which holiday data exists in the calendar,
+    so we can warn if holiday data is stale (older than 30 days).
+    """
     try:
         cur = conn.cursor()
         cur.execute("""
@@ -153,15 +194,21 @@ def get_holiday_data_freshness(conn):
         """)
         row = cur.fetchone()
         cur.close()
-        return row[0] if row else None
+        if row and row[0]:
+            return row[0]
     except Exception:
-        return None
+        pass
+    return None
 
 # ---------------------------------------------------------------------------
 # Script Execution
 # ---------------------------------------------------------------------------
 
 def run_script(python_bin, script_name, args=None):
+    """
+    Launch a script as a subprocess, streaming its stdout/stderr live.
+    Returns True on exit code 0, False otherwise.
+    """
     script_path = os.path.join(SCRIPT_DIR, script_name)
     log("")
     log("=" * 60)
@@ -186,74 +233,93 @@ def run_script(python_bin, script_name, args=None):
         for line in proc.stdout:
             print(line, end='', flush=True)
         proc.wait()
+
         if proc.returncode == 0:
             log(f"[OK] {script_name} completed successfully.")
             return True
         else:
             log(f"[FAIL] {script_name} exited with code {proc.returncode}.")
             return False
+
     except Exception as e:
         log(f"[FAIL] Failed to launch {script_name}: {e}")
         traceback.print_exc()
         return False
 
 # ---------------------------------------------------------------------------
-# Main
+# Main Pipeline
 # ---------------------------------------------------------------------------
 
 def main():
     today = date.today()
     log("=" * 60)
-    log("NEPSE DAILY PIPELINE (Standalone Python Server)")
+    log("NEPSE DAILY PIPELINE STARTED")
     log(f"Date: {today.strftime('%A, %d %B %Y')}")
     log("=" * 60)
 
     python_bin = get_python_bin()
-    log(f"Python: {python_bin}")
+    log(f"Python binary: {python_bin}")
 
-    # STEP 1: Refresh holidays
+    # ------------------------------------------------------------------
+    # STEP 1: Refresh Holiday Calendar
+    # ------------------------------------------------------------------
     log("")
-    log("STEP 1/8: Refreshing holiday calendar...")
-    run_script(python_bin, 'nepse_holiday.py')
+    log("STEP 1/8: Refreshing holiday calendar (nepse_holiday.py)...")
+    holiday_refresh_ok = run_script(python_bin, 'nepse_holiday.py')
+    if not holiday_refresh_ok:
+        log("[WARN] Holiday scraper failed — will rely on existing DB calendar data.")
 
-    # STEP 2: DB connect + holiday freshness check
+    # ------------------------------------------------------------------
+    # STEP 2: Connect to DB and verify holiday data freshness
+    # ------------------------------------------------------------------
     log("")
-    log("STEP 2/8: Checking trading day status...")
+    log("STEP 2/8: Connecting to database and checking trading day status...")
     try:
         conn = get_db_conn()
     except Exception as e:
         log(f"[FATAL] Cannot connect to database: {e}")
-        log(f"[HINT]  Check your config.ini credentials and ensure the DB host is reachable from this server.")
         sys.exit(1)
 
     ensure_pipeline_columns(conn)
 
-    last_holiday = get_holiday_data_freshness(conn)
-    if last_holiday:
-        days_since = (today - last_holiday).days
+    # Warn if holiday API data seems stale (last holiday > 30 days ago)
+    last_holiday_date = get_holiday_api_last_update(conn)
+    if last_holiday_date:
+        days_since = (today - last_holiday_date).days
         if days_since > 30:
-            log(f"[WARN] Holiday data may be stale — last holiday: {last_holiday} ({days_since} days ago).")
+            log(f"[WARN] Holiday data may be stale — last holiday recorded was {last_holiday_date} ({days_since} days ago).")
         else:
-            log(f"[INFO] Holiday data is current. Last holiday on record: {last_holiday}.")
+            log(f"[INFO] Holiday data is current. Most recent holiday on record: {last_holiday_date}.")
+    else:
+        log("[WARN] No holiday records found in calendar. Proceeding with caution.")
 
-    # STEP 3: Holiday / non-trading day check
-    is_holiday, reason = is_today_non_trading(conn)
+    # ------------------------------------------------------------------
+    # STEP 3: Holiday / Non-Trading Day Check
+    # ------------------------------------------------------------------
+    is_holiday, holiday_reason = is_today_non_trading(conn)
+
     if is_holiday:
-        msg = f"Today ({today}) is a non-trading day. Reason: {reason}"
+        msg = f"Today ({today}) is a non-trading day. Reason: {holiday_reason} Pipeline will not run data scrapers."
         log(msg)
         send_notification(conn, "Daily Pipeline — Non-Trading Day", msg, "info")
         record_pipeline_status(conn, today, 'holiday')
         conn.close()
+        log("")
         log("PIPELINE COMPLETE: Stopped — non-trading day.")
         sys.exit(0)
 
-    log(f"[OK] Today ({today}) is a trading day. Proceeding.")
-    send_notification(conn, "Daily Pipeline Started",
-                      f"Trading day confirmed for {today}. Running {len(PIPELINE_SCRIPTS)} scraper steps.",
-                      "scraper")
+    log(f"[OK] Today ({today}) is a trading day. Proceeding with data pipeline.")
+    send_notification(
+        conn,
+        "Daily Pipeline Started",
+        f"Trading day confirmed for {today}. Running {len(PIPELINE_SCRIPTS)} scraper steps.",
+        "scraper"
+    )
     conn.close()
 
-    # STEPS 4-9: Run scrapers
+    # ------------------------------------------------------------------
+    # STEPS 4–9: Run all scraper scripts in order
+    # ------------------------------------------------------------------
     results = {}
     for script_name in PIPELINE_SCRIPTS:
         args = []
@@ -261,50 +327,82 @@ def main():
             args = ['--force']
         success = run_script(python_bin, script_name, args=args)
         results[script_name] = success
+
+        # Record per-step outcome to DB immediately after each script
         try:
             conn = get_db_conn()
-            send_notification(conn,
-                f"Pipeline Step {'OK' if success else 'FAILED'}: {script_name}",
-                f"{script_name} {'completed successfully' if success else 'FAILED — check pipeline.log'} for {today}.",
-                'success' if success else 'error')
+            step_status = 'success' if success else 'error'
+            step_title = f"Pipeline Step {'OK' if success else 'FAILED'}: {script_name}"
+            step_msg = (
+                f"{script_name} completed successfully for {today}."
+                if success else
+                f"{script_name} failed during the daily pipeline run for {today}. Check current_scrape.log for details."
+            )
+            send_notification(conn, step_title, step_msg, step_status)
             conn.close()
         except Exception as e:
-            log(f"[WARN] Could not record notification for {script_name}: {e}")
+            log(f"[WARN] Could not record per-step notification for {script_name}: {e}")
 
-    # Final summary
-    passed = [s for s, ok in results.items() if ok]
-    failed = [s for s, ok in results.items() if not ok]
-
+    # ------------------------------------------------------------------
+    # Final Summary
+    # ------------------------------------------------------------------
     log("")
     log("=" * 60)
     log("DAILY PIPELINE SUMMARY")
     log("=" * 60)
-    for script, ok in results.items():
-        log(f"  {'[OK]  SUCCESS' if ok else '[FAIL] FAILED '}  {script}")
-    log(f"\n  {len(passed)}/{len(PIPELINE_SCRIPTS)} scripts completed successfully.")
 
+    passed = [s for s, ok in results.items() if ok]
+    failed = [s for s, ok in results.items() if not ok]
+
+    for script, ok in results.items():
+        status = "[OK]  SUCCESS" if ok else "[FAIL] FAILED "
+        log(f"  {status}  {script}")
+
+    log("")
+    log(f"  {len(passed)}/{len(PIPELINE_SCRIPTS)} scripts completed successfully.")
+
+    # Write final status to calendar + system_notifications
     try:
         conn = get_db_conn()
-        if not failed:
-            status, notif_type = 'success', 'success'
-            title = "Daily Pipeline Completed Successfully"
-            msg = f"All {len(PIPELINE_SCRIPTS)} steps completed for {today}."
+        if not results:
+            final_status = 'failed'
+        elif not failed:
+            final_status = 'success'
         elif not passed:
-            status, notif_type = 'failed', 'error'
-            title = "Daily Pipeline Failed"
-            msg = f"All steps failed for {today}. Check pipeline.log."
+            final_status = 'failed'
         else:
-            status, notif_type = 'partial', 'warning'
-            title = "Daily Pipeline Completed With Errors"
-            msg = f"{len(passed)}/{len(PIPELINE_SCRIPTS)} steps succeeded. Failed: {', '.join(failed)}."
+            final_status = 'partial'
 
-        record_pipeline_status(conn, today, status, failed or None)
-        send_notification(conn, title, msg, notif_type)
+        record_pipeline_status(conn, today, final_status, failed if failed else None)
+
+        if final_status == 'success':
+            send_notification(
+                conn,
+                "Daily Pipeline Completed Successfully",
+                f"All {len(PIPELINE_SCRIPTS)} scraper steps completed successfully for {today}.",
+                "success"
+            )
+        elif final_status == 'partial':
+            send_notification(
+                conn,
+                "Daily Pipeline Completed With Errors",
+                f"{len(passed)}/{len(PIPELINE_SCRIPTS)} steps succeeded. Failed: {', '.join(failed)}. Check current_scrape.log.",
+                "warning"
+            )
+        else:
+            send_notification(
+                conn,
+                "Daily Pipeline Failed",
+                f"All scraper steps failed for {today}. Check current_scrape.log immediately.",
+                "error"
+            )
         conn.close()
     except Exception as e:
-        log(f"[WARN] Could not write final DB status: {e}")
+        log(f"[WARN] Could not write final status to database: {e}")
 
-    log("\nPIPELINE FINISHED.")
+    log("")
+    log("PIPELINE FINISHED.")
+
 
 if __name__ == "__main__":
     main()

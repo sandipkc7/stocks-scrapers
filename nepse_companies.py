@@ -34,6 +34,7 @@ def send_notification(conn, title, message='', type='info', source='nepse_compan
         cur.close()
         print(f"Notification Sent: [{type.upper()}] {title} - {message}")
     except Exception as e:
+        conn.rollback()
         print(f"Failed to save system notification: {e}")
 
 def store_companies(conn, companies):
@@ -185,6 +186,54 @@ def store_companies(conn, companies):
     print(f"Upserted {len(values)} companies (skipped {skipped}). Total in DB: {total}")
     cur.close()
 
+def populate_chukul_details(conn):
+    print("Fetching Chukul symbol database details...")
+    import requests
+    import warnings
+    from urllib3.exceptions import InsecureRequestWarning
+    
+    # Suppress certificate verification warnings
+    warnings.filterwarnings('ignore', category=InsecureRequestWarning)
+    
+    url = "https://chukul.com/api/data/symbol/"
+    try:
+        response = requests.get(url, verify=False, timeout=30)
+        response.raise_for_status()
+        data = response.json()
+        
+        cur = conn.cursor()
+        
+        # Ensure the columns exist in companies table
+        print("Checking/creating Chukul columns in companies table...")
+        cur.execute('''
+            ALTER TABLE companies ADD COLUMN IF NOT EXISTS chukul_id INTEGER DEFAULT NULL;
+            ALTER TABLE companies ADD COLUMN IF NOT EXISTS chukul_sector_id INTEGER DEFAULT NULL;
+        ''')
+        conn.commit()
+        
+        # Prepare updates
+        updated_count = 0
+        print(f"Loaded {len(data)} symbol entries from Chukul API. Populating table...")
+        for item in data:
+            c_id = item.get('id')
+            c_sec_id = item.get('sector_id')
+            symbol = item.get('symbol')
+            
+            if symbol and c_id is not None:
+                cur.execute('''
+                    UPDATE companies 
+                    SET chukul_id = %s, chukul_sector_id = %s 
+                    WHERE symbol = %s;
+                ''', (c_id, c_sec_id, symbol))
+                updated_count += cur.rowcount
+                
+        conn.commit()
+        cur.close()
+        print(f"Successfully populated Chukul details for {updated_count} companies.")
+        
+    except Exception as e:
+        print(f"Error fetching/populating Chukul data: {e}")
+
 async def fetch_and_store_companies():
     print("Connecting to database...")
     conn = psycopg2.connect(**DB_CONFIG)
@@ -216,6 +265,7 @@ async def fetch_and_store_companies():
             print(f"Sample: symbol={sample_symbol}, name={sample_name}\n")
 
             store_companies(conn, companies)
+            populate_chukul_details(conn)
         else:
             print("No company data retrieved.")
             send_notification(

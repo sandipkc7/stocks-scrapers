@@ -10,31 +10,6 @@ from nepse import AsyncNepse
 
 def setup_db(conn):
     cur = conn.cursor()
-    # Ensure calendar table exists with date as primary key
-    cur.execute('''
-        CREATE TABLE IF NOT EXISTS calendar (
-            date DATE NOT NULL,
-            holiday BOOLEAN DEFAULT FALSE,
-            "Holiday_Description" VARCHAR(255)
-        );
-    ''')
-    # Add UNIQUE constraint on date if not already present (required for ON CONFLICT)
-    cur.execute('''
-        DO $$
-        BEGIN
-            IF NOT EXISTS (
-                SELECT 1 FROM pg_constraint
-                WHERE conrelid = 'calendar'::regclass
-                AND contype IN ('p', 'u')
-                AND conkey = ARRAY(
-                    SELECT attnum FROM pg_attribute
-                    WHERE attrelid = 'calendar'::regclass AND attname = 'date'
-                )
-            ) THEN
-                ALTER TABLE calendar ADD CONSTRAINT calendar_date_unique UNIQUE (date);
-            END IF;
-        END $$;
-    ''')
     # Add Holiday_Description column if it doesn't exist
     cur.execute('''
         ALTER TABLE calendar 
@@ -55,7 +30,6 @@ def setup_db(conn):
     ''')
     conn.commit()
     cur.close()
-
 
 def send_notification(conn, title, message='', type='info', source='nepse_holiday.py'):
     try:
