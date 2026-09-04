@@ -2,7 +2,7 @@ import configparser
 import os
 
 config = configparser.ConfigParser()
-config_path = os.path.join(os.path.dirname(__file__), '..', 'config.ini')
+config_path = os.path.join(os.path.dirname(__file__), 'config.ini')
 
 if not os.path.exists(config_path):
     raise FileNotFoundError(f"Database configuration file not found at {config_path}")
